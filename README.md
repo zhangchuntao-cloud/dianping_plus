@@ -4,7 +4,7 @@
 
 ## 所用技术
 
-*SpringBoot+nginx+MySql+Lombok+MyBatis-Plus+Hutool+Redis*
+*SpringBoot+nginx+MySql+Lombok+MyBatis-Plus+Hutool+Redis+RabbitMQ*
 
 使用 Redis 解决了在集群模式下的 Session共享问题,使用拦截器实现用户的登录校验和权限刷新
 
