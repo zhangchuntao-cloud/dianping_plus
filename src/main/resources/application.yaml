@@ -48,6 +48,29 @@ mybatis-plus:
 hmdp:
   seckill:
     reconcile-interval-ms: 60000 # 对账任务调度间隔
+
+# 可观测性
+#
+# 秒杀链路的可靠性工作（幂等拦截、消息重试、对账补偿）本身是"看不见"的——
+# 代码里做对了，但线上没有任何信号。这里把指标暴露给 Prometheus，
+# 让"有没有超卖""消息有没有丢""重试了多少次"变成能看见的曲线。
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: hmdp # 所有指标统一带应用标签，便于多应用共用一个 Prometheus
+    distribution:
+      percentiles-histogram:
+        # 为这些指标生成直方图，才能在 Grafana 里算 P99
+        seckill.lua.duration: true
+        seckill.consume.duration: true
+        http.server.requests: true
 logging:
   level:
     com.hmdp: debug

@@ -36,6 +36,20 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-aop</artifactId>
         </dependency>
+        <!--
+          可观测性：actuator 暴露 /actuator/prometheus，
+          micrometer 把 JVM / HTTP / 连接池 / 自定义业务指标导出成 Prometheus 格式。
+          秒杀链路的可靠性工作（幂等拦截、重试、对账）本身是"看不见"的，
+          指标是让它可见的唯一途径。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
         <!-- Lettuce 连接池 -->
         <dependency>
             <groupId>org.apache.commons</groupId>

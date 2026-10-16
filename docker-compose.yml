@@ -71,7 +71,56 @@ services:
       retries: 12
       start_period: 30s
 
+  # ==================== 可观测性 ====================
+  #
+  # 秒杀链路的可靠性工作（幂等拦截、消息重试、对账补偿）在代码里做对了，
+  # 但线上完全看不见。这两个服务把"有没有超卖""消息有没有丢""重试了多少次"
+  # 变成能看见的曲线。
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: dianping-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"    # http://localhost:9090
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    # 抓取目标在宿主机上（应用直接跑在宿主机 8081，不在容器里）。
+    # macOS 的 Docker Desktop 自带 host.docker.internal，这行是给 Linux 用的。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: dianping-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"    # http://localhost:3000
+    environment:
+      # 免登录，clone 下来直接能看大盘。仅适用于本地演示环境。
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      # 数据源与大盘都通过 provisioning 自动加载，不需要手工点界面配置
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
 volumes:
   mysql-data:
   redis-data:
   rabbitmq-data:
+  prometheus-data:
+  grafana-data:

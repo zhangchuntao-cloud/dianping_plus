@@ -3,6 +3,7 @@ package com.hmdp.listener;
 import cn.hutool.json.JSONUtil;
 import com.hmdp.config.QueueConfig;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.metrics.SeckillMetrics;
 import com.hmdp.service.IVoucherOrderService;
 import com.rabbitmq.client.Channel;
 import lombok.RequiredArgsConstructor;
@@ -41,6 +42,7 @@ public class SeckillVoucherListener {
 
     private final IVoucherOrderService voucherOrderService;
     private final RabbitTemplate rabbitTemplate;
+    private final SeckillMetrics seckillMetrics;
 
     @RabbitListener(queues = QueueConfig.SECKILL_ORDER_QUEUE)
     public void onSeckillOrder(Message message, Channel channel) throws IOException {
@@ -53,18 +55,22 @@ public class SeckillVoucherListener {
             log.error("秒杀消息无法解析，转入死信队列", e);
             republish(message, QueueConfig.SECKILL_DLX_EXCHANGE, QueueConfig.SECKILL_DLQ_ROUTING_KEY,
                     retryCount(message), "parse-error");
+            seckillMetrics.recordConsumeToDlq();
             channel.basicAck(deliveryTag, false);
             return;
         }
 
+        long consumeStart = System.nanoTime();
         try {
             voucherOrderService.createVoucherOrder(order);
+            seckillMetrics.recordOrderCreated();
             channel.basicAck(deliveryTag, false);
         } catch (DuplicateKeyException e) {
             // 唯一索引 uk_user_voucher 挡住了重复投递 —— 这是幂等成功，不是失败。
             // 绝不能重试，否则会无限循环。
             log.info("重复订单消息，按幂等成功处理 orderId={} userId={}",
                     order.getId(), order.getUserId());
+            seckillMetrics.recordConsumeDuplicate();
             channel.basicAck(deliveryTag, false);
         } catch (Exception e) {
             int retry = retryCount(message);
@@ -73,12 +79,16 @@ public class SeckillVoucherListener {
                         retry + 1, QueueConfig.MAX_RETRY, order.getId(), e);
                 republish(message, QueueConfig.SECKILL_RETRY_EXCHANGE, QueueConfig.SECKILL_RETRY_ROUTING_KEY,
                         retry + 1, e.getClass().getSimpleName());
+                seckillMetrics.recordConsumeRetry();
             } else {
                 log.error("秒杀订单重试耗尽，转入死信队列 orderId={}", order.getId(), e);
                 republish(message, QueueConfig.SECKILL_DLX_EXCHANGE, QueueConfig.SECKILL_DLQ_ROUTING_KEY,
                         retry, e.getClass().getSimpleName());
+                seckillMetrics.recordConsumeToDlq();
             }
             channel.basicAck(deliveryTag, false);
+        } finally {
+            seckillMetrics.recordConsumeDuration(System.nanoTime() - consumeStart);
         }
     }
 

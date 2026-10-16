@@ -4,6 +4,7 @@ import com.hmdp.config.QueueConfig;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.exception.SeckillStockExhaustedException;
+import com.hmdp.metrics.SeckillMetrics;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.SeckillKeys;
@@ -53,6 +54,7 @@ public class SeckillReconcileJob {
     private final ISeckillVoucherService seckillVoucherService;
     private final IVoucherOrderService voucherOrderService;
     private final RabbitAdmin rabbitAdmin;
+    private final SeckillMetrics seckillMetrics;
 
     /** voucherId -> 连续漂移次数 */
     private final Map<Long, Integer> driftStreak = new ConcurrentHashMap<>();
@@ -163,6 +165,17 @@ public class SeckillReconcileJob {
 
         // ---- 场景四：Redis 库存回写 ----
         resyncRedisStock(voucherId, dbStock, expectedStock);
+
+        // 把这一轮的观测值刷进指标，供 Grafana 展示。
+        // 注意：这些值只在**流水线静止**时才是可比的（见上方 isQuiescent 的注释），
+        // 所以非静止时不去刷新——否则大盘上会出现假的"库存漂移"尖刺。
+        String redisStockStr = stringRedisTemplate.opsForValue().get(SeckillKeys.stock(voucherId));
+        long redisStockValue = redisStockStr == null ? -1 : Long.parseLong(redisStockStr);
+        seckillMetrics.refreshSnapshot(
+                redisStockValue,
+                dbStock == null ? -1 : dbStock,
+                orderCount,
+                queueDepth(QueueConfig.SECKILL_DLQ));
     }
 
     /** 业务队列与重试队列都已排空（含未 ACK 的在途消息） */
@@ -232,6 +245,9 @@ public class SeckillReconcileJob {
     /** 结构化告警：统一 tag 便于日志检索，并累计计数供压测断言读取 */
     private void alert(String type, Long voucherId, String detail) {
         alertCounters.computeIfAbsent(type, k -> new AtomicLong()).incrementAndGet();
+        // 同步打进指标，这样 Grafana 上能看到"对账发现了多少异常"的趋势，
+        // 而不是只能翻日志
+        seckillMetrics.recordReconcileAlert();
         log.error("SEC_ALERT {} voucherId={} {}", type, voucherId, detail);
     }
 

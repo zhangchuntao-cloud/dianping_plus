@@ -8,6 +8,7 @@ import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.exception.SeckillStockExhaustedException;
 import com.hmdp.mapper.VoucherOrderMapper;
+import com.hmdp.metrics.SeckillMetrics;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.RedisIdWorker;
@@ -53,6 +54,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
+    @Resource
+    private SeckillMetrics seckillMetrics;
+
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
     private static final DefaultRedisScript<Long> ROLLBACK_SCRIPT;
 
@@ -75,15 +79,18 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         Long userId = user.getId();
         long orderId = redisIdWorker.nextId("order");
 
+        long luaStart = System.nanoTime();
         Long result = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
                 List.of(SeckillKeys.stock(voucherId), SeckillKeys.orders(voucherId)),
                 userId.toString(), String.valueOf(orderId));
+        seckillMetrics.recordLuaDuration(System.nanoTime() - luaStart);
 
         // 旧版把 null 直接当成 0（成功）继续往下走 —— 脚本执行失败与成功无法区分，
         // 连脚本压根没跑通都会发 MQ 消息。这里必须显式区分。
         if (result == null) {
             log.error("秒杀 Lua 返回 null，脚本执行异常 voucherId={} userId={}", voucherId, userId);
+            seckillMetrics.recordRequest(SeckillMetrics.RESULT_SYSTEM_ERROR);
             return Result.fail("系统繁忙，请稍后再试");
         }
 
@@ -91,12 +98,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         if (r == -1) {
             // 旧版把这个分支也报成"不能重复下单"，完全误导。它其实是库存未初始化。
             log.error("秒杀库存未初始化，需从 DB 重建 voucherId={}", voucherId);
+            seckillMetrics.recordRequest(SeckillMetrics.RESULT_NOT_INITIALIZED);
             return Result.fail("秒杀尚未开始或已结束");
         }
         if (r == 1) {
+            seckillMetrics.recordRequest(SeckillMetrics.RESULT_OUT_OF_STOCK);
             return Result.fail("库存不足");
         }
         if (r == 2) {
+            seckillMetrics.recordRequest(SeckillMetrics.RESULT_DUPLICATE);
             return Result.fail("不能重复下单");
         }
 
@@ -109,9 +119,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
         if (!sendOrderMessage(order)) {
             rollbackSeckill(voucherId, userId, orderId);
+            seckillMetrics.recordRequest(SeckillMetrics.RESULT_SYSTEM_ERROR);
             return Result.fail("系统繁忙，请稍后再试");
         }
 
+        seckillMetrics.recordRequest(SeckillMetrics.RESULT_SUCCESS);
         return Result.ok(orderId);
     }
 
@@ -149,6 +161,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
             if (!confirm.isAck()) {
                 log.error("broker 拒绝订单消息 orderId={} cause={}", order.getId(), confirm.getReason());
+                seckillMetrics.recordMessageSendFailed();
                 return false;
             }
             // getReturned() 在 confirm future 完成前就已填充，所以这一次检查同时覆盖了
@@ -158,11 +171,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                         order.getId(),
                         correlationData.getReturned().getExchange(),
                         correlationData.getReturned().getRoutingKey());
+                seckillMetrics.recordMessageSendFailed();
                 return false;
             }
+            seckillMetrics.recordMessageSent();
             return true;
         } catch (Exception e) {
             log.error("发送秒杀订单消息失败 orderId={}", order.getId(), e);
+            seckillMetrics.recordMessageSendFailed();
             return false;
         }
     }

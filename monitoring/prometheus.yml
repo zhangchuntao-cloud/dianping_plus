@@ -1,0 +1,15 @@
+# Prometheus 抓取配置
+#
+# 抓取目标是宿主机上运行的 Spring Boot 应用（8081），不是容器。
+# Docker Desktop for Mac 下 host.docker.internal 指向宿主机。
+global:
+  scrape_interval: 2s        # 压测场景下需要高分辨率，2s 能看清秒级波动
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: 'hmdp-seckill'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['host.docker.internal:8081']
+        labels:
+          application: 'hmdp'
