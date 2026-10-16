@@ -1,320 +1,219 @@
 package com.hmdp.service.impl;
 
-import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.json.JSONUtil;
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.config.QueueConfig;
 import com.hmdp.dto.Result;
+import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.exception.SeckillStockExhaustedException;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
-import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SeckillKeys;
 import com.hmdp.utils.UserHolder;
-import com.rabbitmq.client.Channel;
+import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.ibatis.javassist.bytecode.stackmap.BasicBlock;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
-import org.springframework.amqp.core.Message;
-import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.core.MessageDeliveryMode;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.aop.framework.AopContext;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
-import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import javax.annotation.PostConstruct;
-import javax.annotation.Resource;
-import java.time.Duration;
-import java.util.Collections;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
- * <p>
- *  服务实现类
- * </p>
+ * 秒杀下单。
  *
- * @author 虎哥
- * @since 2021-12-22
+ * <p><b>请求线程只碰 Redis，绝不碰 MySQL</b>：Lua 原子预检（查库存 + 查重 + 扣减 + 记录）
+ * 通过后，把订单丢进 RabbitMQ 就返回。真正的落库由消费者异步完成 —— 这是异步削峰的全部意义。
  */
 @Slf4j
 @Service
-public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder>
+        implements IVoucherOrderService {
+
+    /** 等待 broker 确认的最长时间。本机 broker 实际是亚毫秒级，这个值只是兜底 */
+    private static final long CONFIRM_TIMEOUT_MS = 500L;
 
     @Resource
     private ISeckillVoucherService seckillVoucherService;
 
     @Resource
     private RabbitTemplate rabbitTemplate;
+
     @Resource
     private RedisIdWorker redisIdWorker;
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
-    @Resource
-    private RedissonClient redissonClient;
-
-    /**
-     * 脚本初始化
-     */
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+    private static final DefaultRedisScript<Long> ROLLBACK_SCRIPT;
+
     static {
-        SECKILL_SCRIPT=new DefaultRedisScript<>();
+        SECKILL_SCRIPT = new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
         SECKILL_SCRIPT.setResultType(Long.class);
+
+        ROLLBACK_SCRIPT = new DefaultRedisScript<>();
+        ROLLBACK_SCRIPT.setLocation(new ClassPathResource("seckill_rollback.lua"));
+        ROLLBACK_SCRIPT.setResultType(Long.class);
     }
 
-//    //阻塞队列，线程从中获取时，如果为空，则线程阻塞
-//    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
-//
-//    @PostConstruct
-//    private void init(){
-//        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
-//    }
-//    private class VoucherOrderHandler implements Runnable {
-//        String queueName="stream.orders";
-//        @Override
-//        public void run() {
-//            while (true) {
-//                try {
-//                    //1.获取消息队列中的队列信息
-//                    //XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS streams.orders >
-//                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
-//                            Consumer.from("g1", "c1"),
-//                            StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
-//                            StreamOffset.create(queueName, ReadOffset.lastConsumed())
-//                    );
-//                    //2.判断消息获取是否成功
-//                    if (list == null || list.isEmpty()) {
-//                        //2.1.如果获取失败，说明没有消息，继续下一次循环
-//                        continue;
-//                    }
-//                    //3.解析消息中的订单信息
-//                    MapRecord<String, Object, Object> record = list.get(0);
-//                    Map<Object, Object> values = record.getValue();
-//                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
-//
-//                    //4.如果获取成功，可以下单
-//                    handleVoucherOrder(voucherOrder);
-//
-//                    //5.ACK确认 SACK stream.orders g1 id
-//                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
-//
-//                }catch (Exception e){
-//                    log.error("处理订单异常",e);
-//                    try {
-//                        handPendingList();
-//                    } catch (InterruptedException ex) {
-//                        throw new RuntimeException(ex);
-//                    }
-//                }
-//            }
-//
-//        }
-//
-//        private void handPendingList() throws InterruptedException {
-//            while (true) {
-//                try {
-//                    //1.获取pending-list中的队列信息
-//                    //XREADGROUP GROUP g1 c1 COUNT 1 STREAMS streams.orders 0
-//                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
-//                            Consumer.from("g1", "c1"),
-//                            StreamReadOptions.empty().count(1),
-//                            StreamOffset.create(queueName, ReadOffset.from("0"))
-//                    );
-//                    //2.判断消息获取是否成功
-//                    if (list == null || list.isEmpty()) {
-//                        //2.1.如果获取失败，说明pending-list没有消息，结束循环
-//                        break;
-//                    }
-//                    //3.解析消息中的订单信息
-//                    MapRecord<String, Object, Object> record = list.get(0);
-//                    Map<Object, Object> values = record.getValue();
-//                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
-//
-//                    //4.如果获取成功，可以下单
-//                    handleVoucherOrder(voucherOrder);
-//
-//                    //5.ACK确认 SACK stream.orders g1 id
-//                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
-//                }catch (Exception e){
-//                    log.error("处理pending-list订单异常",e);
-//                    Thread.sleep(20);
-//                }
-//            }
-//        }
-//    }
-   /* private BlockingQueue<VoucherOrder> orderTasks=new ArrayBlockingQueue<>(1024*1024);
-    private class VoucherOrderHandler implements Runnable {
-
-        @Override
-        public void run() {
-            while (true) {
-                try {
-                    //1.获取队列中的队列信息
-                    VoucherOrder order = orderTasks.take();
-                    //2.创建订单
-                    handleVoucherOrder(order);
-
-                } catch (InterruptedException e) {
-                    log.error("处理订单异常", e);
-                }
-
-            }
-
-        }
-    }*/
-
-        public void handleVoucherOrder(VoucherOrder voucherOrder) {
-            //1.获取用户
-            Long userId = voucherOrder.getUserId();
-            //2.创建锁对象
-            RLock lock = redissonClient.getLock("lock:order:" + userId);
-            //3.获取锁
-            boolean isLock = lock.tryLock();
-            //4.判断是否获取锁成功
-            if(!isLock) {
-                //失败，返回错误或重试
-               log.error("不允许重复下单");
-               return;
-            }
-            try {
-                //直接调用，不会触发spring aop的事务管理
-                //要通过代理调用，获取代理对象，才会被spring aop拦截
-                proxy.createVoucherOrder(voucherOrder);
-            } catch (IllegalStateException e) {
-                throw new RuntimeException(e);
-            }finally {
-                //释放锁
-                lock.unlock();
-            }
-        }
-    private IVoucherOrderService proxy;
     @Override
     public Result seckillVoucher(Long voucherId) {
-        //获取用户id
-        Long userId = UserHolder.getUser().getId();
-        //获取订单id
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("请先登录");
+        }
+        Long userId = user.getId();
         long orderId = redisIdWorker.nextId("order");
-        //1.执行lua脚本
+
         Long result = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
-                Collections.emptyList(),
-                voucherId.toString(), userId.toString(),String.valueOf(orderId)
-        );
-        //2.判断结果是否为0
-        int r = 0;
-        if (result != null) {
-            r = result.intValue();
+                List.of(SeckillKeys.stock(voucherId), SeckillKeys.orders(voucherId)),
+                userId.toString(), String.valueOf(orderId));
+
+        // 旧版把 null 直接当成 0（成功）继续往下走 —— 脚本执行失败与成功无法区分，
+        // 连脚本压根没跑通都会发 MQ 消息。这里必须显式区分。
+        if (result == null) {
+            log.error("秒杀 Lua 返回 null，脚本执行异常 voucherId={} userId={}", voucherId, userId);
+            return Result.fail("系统繁忙，请稍后再试");
         }
-        if(r!=0){
-            //2.1.不为0，代表没有购买资格
-            return Result.fail(r==1?"库存不足":"不能重复下单");
+
+        int r = result.intValue();
+        if (r == -1) {
+            // 旧版把这个分支也报成"不能重复下单"，完全误导。它其实是库存未初始化。
+            log.error("秒杀库存未初始化，需从 DB 重建 voucherId={}", voucherId);
+            return Result.fail("秒杀尚未开始或已结束");
         }
-//        //3.获取代理对象
-//        proxy = (IVoucherOrderService) AopContext.currentProxy();
-//        //4.返回订单id
-//        return Result.ok(orderId);
-        // 2. 脱离请求线程，发消息给 RabbitMQ
-        VoucherOrder order = new VoucherOrder();
-        order.setId(orderId);
-        order.setUserId(userId);
-        order.setVoucherId(voucherId);
-        // 你可以用 JSON，也可以用序列化
-        // 增加消息发送的异常处理
-        //放入mq
-        String jsonStr = JSONUtil.toJsonStr(order);
-        try {
-            rabbitTemplate.convertAndSend("X","XA",jsonStr );
-        } catch (Exception e) {
-            log.error("发送 RabbitMQ 消息失败，订单ID: {}", orderId, e);
-            throw new RuntimeException("发送消息失败");
+        if (r == 1) {
+            return Result.fail("库存不足");
         }
-        // 3. 返回订单号给前端（实际下单异步处理）
+        if (r == 2) {
+            return Result.fail("不能重复下单");
+        }
+
+        // r == 0：Redis 侧已扣减并记录。接下来必须保证消息真的进了 broker，
+        // 否则这个用户的库存白扣、且他再也抢不到（Lua 会返回 2）。
+        VoucherOrder order = new VoucherOrder()
+                .setId(orderId)
+                .setUserId(userId)
+                .setVoucherId(voucherId);
+
+        if (!sendOrderMessage(order)) {
+            rollbackSeckill(voucherId, userId, orderId);
+            return Result.fail("系统繁忙，请稍后再试");
+        }
+
         return Result.ok(orderId);
     }
 
+    /**
+     * 发送订单消息并<b>同步等待</b> broker 确认。
+     *
+     * <p>为什么要等：{@code convertAndSend} 默认是 fire-and-forget —— 只要 TCP 写成功就返回，
+     * broker 是否真的持久化了、消息是否路由到了队列，发送方一概不知。开启
+     * {@code publisher-confirm-type: correlated} 后可以拿到 {@link CorrelationData} 的 future，
+     * 从而把"消息确实落地了"变成可判断的事实。
+     *
+     * <p>代价是热路径上多了最多 {@link #CONFIRM_TIMEOUT_MS} 毫秒。本机 broker 实测亚毫秒，
+     * 这个超时是安全网而非常态开销。
+     *
+     * @return true 表示 broker 已确认且消息可路由
+     */
+    private boolean sendOrderMessage(VoucherOrder order) {
+        CorrelationData correlationData = new CorrelationData(String.valueOf(order.getId()));
+        try {
+            rabbitTemplate.convertAndSend(
+                    QueueConfig.SECKILL_EXCHANGE,
+                    QueueConfig.SECKILL_ORDER_ROUTING_KEY,
+                    JSONUtil.toJsonStr(order),
+                    message -> {
+                        message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+                        message.getMessageProperties().setMessageId(String.valueOf(order.getId()));
+                        message.getMessageProperties().setContentType("application/json");
+                        message.getMessageProperties().setHeader(QueueConfig.HEADER_RETRY_COUNT, 0);
+                        return message;
+                    },
+                    correlationData);
 
-//    public Result seckillVoucher(Long voucherId) {
-//        //查询用户券信息
-//        SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
-//        //判断秒杀时间
-//        //是否开始
-//        LocalDateTime beginTime = voucher.getBeginTime();
-//        if(beginTime.isAfter(LocalDateTime.now())){
-//            return Result.fail("秒杀尚未开始！");
-//        }
-//        //是否结束
-//        LocalDateTime endTime = voucher.getEndTime();
-//        if(endTime.isBefore(LocalDateTime.now())){
-//            return Result.fail("秒杀已经结束");
-//        }
-//        //判断库存呢是否充足
-//        if(voucher.getStock()<=0){
-//            return Result.fail("库存不足！");
-//        }
-//        Long userId = UserHolder.getUser().getId();
-//       //创建锁对象
-//        //SimpleRedisLock  lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
-//        RLock lock = redissonClient.getLock("lock:order:" + userId);
-//        //获取锁
-//        boolean isLock = lock.tryLock();
-//        //判断是否获取锁成功
-//        if(!isLock) {
-//            //失败，返回错误或重试
-//            return Result.fail("不允许重复下单");
-//
-//        }
-//        try {
-//            //直接调用，不会触发spring aop的事务管理
-//            //要通过代理调用，获取代理对象，才会被spring aop拦截
-//            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
-//            return proxy.createVoucherOrder(voucherId);
-//        } catch (IllegalStateException e) {
-//            throw new RuntimeException(e);
-//        }finally {
-//            //释放锁
-//            lock.unlock();
-//        }
-//
-//
-//    }
+            CorrelationData.Confirm confirm =
+                    correlationData.getFuture().get(CONFIRM_TIMEOUT_MS, TimeUnit.MILLISECONDS);
 
-    @Transactional
+            if (!confirm.isAck()) {
+                log.error("broker 拒绝订单消息 orderId={} cause={}", order.getId(), confirm.getReason());
+                return false;
+            }
+            // getReturned() 在 confirm future 完成前就已填充，所以这一次检查同时覆盖了
+            // "broker 没持久化" 和 "没有任何队列匹配路由键" 两种情况。
+            if (correlationData.getReturned() != null) {
+                log.error("订单消息无法路由 orderId={} exchange={} rk={}",
+                        order.getId(),
+                        correlationData.getReturned().getExchange(),
+                        correlationData.getReturned().getRoutingKey());
+                return false;
+            }
+            return true;
+        } catch (Exception e) {
+            log.error("发送秒杀订单消息失败 orderId={}", order.getId(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 发送失败时把 Redis 侧的扣减回滚掉。
+     *
+     * <p>回滚脚本会比对 orderId 才动手，避免把一条其实已经投递成功的有效订单抹掉。
+     * 万一回滚本身也失败（比如 Redis 挂了），对账任务会兜底 —— 这正是"对账"存在的意义。
+     */
+    private void rollbackSeckill(Long voucherId, Long userId, long orderId) {
+        try {
+            stringRedisTemplate.execute(
+                    ROLLBACK_SCRIPT,
+                    List.of(SeckillKeys.stock(voucherId), SeckillKeys.orders(voucherId)),
+                    userId.toString(), String.valueOf(orderId));
+            log.warn("已回滚秒杀资格 voucherId={} userId={} orderId={}", voucherId, userId, orderId);
+        } catch (Exception e) {
+            log.error("回滚秒杀资格失败，等待对账兜底 voucherId={} userId={} orderId={}",
+                    voucherId, userId, orderId, e);
+        }
+    }
+
+    /**
+     * 幂等落库。MQ 消费者与对账任务共用这一个入口。
+     *
+     * <p><b>顺序是刻意的：先插订单，再扣库存。</b>
+     * <ul>
+     *   <li>重复消息：INSERT 先撞唯一索引 {@code uk_user_voucher} 抛
+     *       {@code DuplicateKeyException}，此时库存分毫未动，事务回滚干净利落。</li>
+     *   <li>库存耗尽：抛 {@link SeckillStockExhaustedException}，事务回滚会把刚插入的订单
+     *       一并撤销，不会留下"有订单没扣库存"的脏数据。</li>
+     * </ul>
+     * 两个操作在同一事务里，这是"要么全成、要么全不成"的唯一保证。
+     *
+     * <p><b>注意异常必须在事务方法之外捕获</b>（见 {@code SeckillVoucherListener}）——
+     * 在这里面 catch 住的话事务不会回滚。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
     public void createVoucherOrder(VoucherOrder voucherOrder) {
-        //一人一单
-        //查询订单
-        Long userId =voucherOrder.getUserId();
-            int count = query().eq("user_id", userId).eq("voucher_id", voucherOrder.getVoucherId()).count();
-            //判断是否存在
-            if (count > 0) {
-                //用户已经购买过了
-                log.error("用户已经购买过一次了");
-                return;
-            }
-            //扣减库存
-            boolean success = seckillVoucherService
-                    .update()
-                    .setSql("stock=stock-1")
-                    .eq("voucher_id", voucherOrder.getVoucherId())
-                    .gt("stock", 0)
-                    .update();
-            if (!success) {
-                log.error("库存不足");
-                return ;
-            }
+        save(voucherOrder);
 
-            save(voucherOrder);
+        boolean deducted = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherOrder.getVoucherId())
+                .gt("stock", 0)
+                .update();
 
+        if (!deducted) {
+            throw new SeckillStockExhaustedException(voucherOrder.getVoucherId(), voucherOrder.getUserId());
+        }
     }
 }

@@ -7,15 +7,15 @@ import com.hmdp.mapper.VoucherMapper;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherService;
-import com.hmdp.utils.RedisConstants;
+import com.hmdp.utils.SeckillKeys;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-import javax.annotation.Resource;
+import jakarta.annotation.Resource;
 import java.util.List;
-
-import static com.hmdp.utils.RedisConstants.SECKILL_STOCK_KEY;
 
 /**
  * <p>
@@ -53,8 +53,19 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         seckillVoucher.setBeginTime(voucher.getBeginTime());
         seckillVoucher.setEndTime(voucher.getEndTime());
         seckillVoucherService.save(seckillVoucher);
-        //保存秒杀得库存到redis
-        stringRedisTemplate.opsForValue().set(SECKILL_STOCK_KEY +voucher.getId(),voucher.getStock().toString());
 
+        // Redis 不是事务资源，直接写在这里会出现"DB 回滚了但 Redis 已写入"的幽灵库存 ——
+        // 库存 key 存在、DB 里却没有这张券，Lua 预检会一直放行。
+        // 注册事务同步器，等 DB 真正提交之后再写 Redis。
+        String stock = voucher.getStock().toString();
+        Long voucherId = voucher.getId();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                stringRedisTemplate.opsForValue().set(SeckillKeys.stock(voucherId), stock);
+                // 总量 key 供对账使用：应剩库存 = 总量 - 已售订单数
+                stringRedisTemplate.opsForValue().set(SeckillKeys.total(voucherId), stock);
+            }
+        });
     }
 }
