@@ -1,0 +1,77 @@
+# 黑马点评 —— 本地中间件一键启动
+#
+# 端口刻意错开本机原生服务（3306/6379/5672/15672），避免冲突：
+#   MySQL    3307 -> 3306
+#   Redis    6380 -> 6379
+#   RabbitMQ 5673 -> 5672   （管理台 15673 -> 15672，guest/guest）
+#
+# 用法：
+#   docker compose up -d          启动
+#   docker compose ps             查看健康状态
+#   docker compose down           停止（保留数据）
+#   docker compose down -v        停止并清空数据（重新导入 hmdp.sql）
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: dianping-mysql
+    restart: unless-stopped
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: dingping
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --default-time-zone=+08:00
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 首次启动自动导入建表脚本（库名由 MYSQL_DATABASE 决定）
+      - ./src/main/resources/db/hmdp.sql:/docker-entrypoint-initdb.d/01-hmdp.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: dianping-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: dianping-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5673:5672"    # AMQP
+      - "15673:15672"  # 管理台 http://localhost:15673
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  mysql-data:
+  redis-data:
+  rabbitmq-data:
