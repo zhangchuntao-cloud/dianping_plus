@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 # ---------------------------------------------------------------- 工具
 
@@ -54,11 +55,28 @@ def redis_cmd(cmd, args):
 # ---------------------------------------------------------------- 造登录态
 
 
-def seed_tokens(args):
+def resolve_tokens(args):
     """
-    按 RefreshTokenInterceptor 读取的结构造登录态：
-    key = login:token:{token}，类型 Hash，字段 id / nickName / icon。
+    拿到压测用的 token 列表。两条路：
+
+    A. --token-file：读 VoucherOrderControllerTest#login 产出的文件（走真实登录流程）
+    B. 默认：直接按 Hash 结构往 Redis 灌登录态，跳过登录
+       key = login:token:{token}，字段 id / nickName / icon
+       （RefreshTokenInterceptor 就是这么读的）
+
+    B 更快、不依赖应用启动，但 A 更接近真实链路。
     """
+    if args.token_file:
+        path = Path(args.token_file)
+        if not path.exists():
+            raise SystemExit(
+                f"token 文件不存在：{path}\n"
+                f"先生成：mvn test -Dtest=VoucherOrderControllerTest"
+            )
+        tokens = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        print(f"  从 {path} 读取 {len(tokens)} 个 token")
+        return tokens[: args.users]
+
     users = mysql(
         f"SELECT id, phone FROM tb_user ORDER BY id LIMIT {args.users}", args
     ).splitlines()
@@ -70,7 +88,7 @@ def seed_tokens(args):
     for row in users:
         uid = row.split("\t")[0]
         token = uuid.uuid4().hex
-        tokens.append((token, uid))
+        tokens.append(token)
         lines.append(f"HSET login:token:{token} id {uid} nickName u{uid} icon i{uid}")
         lines.append(f"EXPIRE login:token:{token} 7200")
 
@@ -115,7 +133,7 @@ def run_load(args, tokens):
 
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=len(tokens)) as pool:
-        results = list(pool.map(lambda t: fire(args, t[0]), tokens))
+        results = list(pool.map(lambda t: fire(args, t), tokens))
     wall = time.perf_counter() - start
 
     latencies = sorted(r[0] for r in results)
@@ -241,6 +259,12 @@ def main():
     p.add_argument("--voucher-id", type=int, default=10)
     p.add_argument("--users", type=int, default=300, help="并发用户数")
     p.add_argument("--timeout", type=float, default=10.0)
+    p.add_argument(
+        "--token-file",
+        default=None,
+        help="从 VoucherOrderControllerTest#login 产出的 token 文件读取（走真实登录流程）；"
+        "不传则直接往 Redis 灌登录态",
+    )
     p.add_argument("--mysql-host", default="127.0.0.1")
     p.add_argument("--mysql-port", default="3307")
     p.add_argument("--mysql-user", default="root")
@@ -260,8 +284,8 @@ def main():
     print(f"秒杀压测  并发={args.users}  券={args.voucher_id}")
     print("=" * 62)
 
-    print("\n[1/4] 造登录态")
-    tokens = seed_tokens(args)
+    print("\n[1/4] 准备登录态")
+    tokens = resolve_tokens(args)
 
     if args.chaos_drop_redis:
         print("\n  ⚡ 混沌注入：删除 Redis 下单记录（模拟 Redis 丢 key / 内存淘汰）")

@@ -21,3 +21,6 @@ replay_pid*
 # --- OS ---
 .DS_Store
 Thumbs.db
+
+# 压测生成的 token 列表
+src/test/resources/tokens.txt
