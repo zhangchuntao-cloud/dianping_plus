@@ -109,8 +109,13 @@ public class CacheClient {
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }finally {
-                    //释放锁
-                    unLock(key);
+                    // 释放锁。必须释放 lockKey 而不是 key ——
+                    // 之前这里传的是 key，导致两个问题：
+                    //   1. lockKey 永不释放，只能等 10 秒 TTL 自然过期，
+                    //      这期间其他线程拿不到锁，缓存重建被阻塞；
+                    //   2. 更糟的是把数据 key 本身删掉了，等于刚重建完的缓存立刻被删，
+                    //      重建完全白做。
+                    unLock(lockKey);
                 }
             });
 

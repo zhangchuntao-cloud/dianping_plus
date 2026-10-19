@@ -54,6 +54,14 @@ public class RefreshTokenInterceptor implements HandlerInterceptor {
 
     @Override
     public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) throws Exception {
+        // 必须清理 ThreadLocal。
+        //
+        // 原实现是空的（只调了 super），而 Tomcat 的线程是复用的——
+        // 一个线程处理完 A 用户的请求后，ThreadLocal 里的 UserDTO 会残留下来。
+        // 若下一个请求恰好没带 token（或 token 失效），
+        // RefreshTokenInterceptor 会直接 return true 而**不覆盖** ThreadLocal，
+        // 于是 B 用户的请求就会读到 A 用户的身份 —— 这是串号。
+        UserHolder.removeUser();
         HandlerInterceptor.super.afterCompletion(request, response, handler, ex);
     }
 }

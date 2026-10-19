@@ -48,6 +48,16 @@ mybatis-plus:
 hmdp:
   seckill:
     reconcile-interval-ms: 60000 # 对账任务调度间隔
+  upload:
+    # 图片存放根目录。默认是工作目录下的 uploads/imgs（跨平台可用）。
+    # 原实现硬编码了 D:\tlias\... 这个课程环境的 Windows 路径，
+    # 在 macOS / Linux 上每次上传都会 500。
+    image-dir: uploads/imgs
+  voucher:
+    # 允许调用造券接口（POST /voucher、POST /voucher/seckill）的用户 id，逗号分隔。
+    # 留空表示不限制（便于本地开发）；**部署时必须配置**，否则任何人都能造券——
+    # 造券会把库存写进 Redis，等于可以凭空创造秒杀库存。
+    admin-ids: ""
 
 # 可观测性
 #
