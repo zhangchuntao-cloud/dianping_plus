@@ -73,8 +73,11 @@ management:
     health:
       show-details: always
   metrics:
-    tags:
-      application: hmdp # 所有指标统一带应用标签，便于多应用共用一个 Prometheus
+    # 注意：这里刻意不配 metrics.tags.application。
+    # Spring Boot 的 Prometheus 注册表默认已经注入了 application 标签（取自
+    # spring.application.name），再从 commonTags 配一个同名标签会导致 Prometheus
+    # 把其中之一重命名为 exported_application —— 同一个指标出现两条序列，
+    # 大盘上的 stat 面板就会显示成两个值。
     distribution:
       percentiles-histogram:
         # 为这些指标生成直方图，才能在 Grafana 里算 P99

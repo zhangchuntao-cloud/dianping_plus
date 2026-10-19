@@ -11,3 +11,10 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: false
+    # 必须显式指定 UID！
+    #
+    # 不写的话 Grafana 会自动生成一个随机 UID（如 PBFA97CFB590B2093），
+    # 而大盘 JSON 里引用的是固定值 —— 两者对不上，结果是**所有面板静默显示
+    # "No data" 且不报错**。这个坑我踩过：第一次截图整个大盘全是 No data。
+    # 显式指定后，数据源与大盘的引用就是同一份事实源。
+    uid: prometheus

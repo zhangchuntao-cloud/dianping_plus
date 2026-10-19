@@ -172,6 +172,7 @@ public class SeckillReconcileJob {
         String redisStockStr = stringRedisTemplate.opsForValue().get(SeckillKeys.stock(voucherId));
         long redisStockValue = redisStockStr == null ? -1 : Long.parseLong(redisStockStr);
         seckillMetrics.refreshSnapshot(
+                voucherId,
                 redisStockValue,
                 dbStock == null ? -1 : dbStock,
                 orderCount,
