@@ -1,0 +1,645 @@
+{
+  "title": "秒杀链路可靠性",
+  "uid": "hmdp-seckill",
+  "tags": [
+    "hmdp",
+    "seckill"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "① 请求总览",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "秒杀请求速率（按终态）",
+      "description": "看拒绝原因的构成。库存不足占大头是正常的；如果 duplicate 突增，说明有人在刷；system_error 必须为 0。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(seckill_requests_total[1m])) by (result)",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "累计成功订单",
+      "description": "秒杀预检通过并成功投递消息的请求数。注意：这是「消息已投递」，不等于「订单已落库」——后者看下面的消费面板。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(seckill_requests_total{result=\"success\"})",
+          "legendFormat": "成功"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "系统繁忙（必须为 0）",
+      "description": "Lua 执行异常、或消息投递失败并已回滚 Redis 扣减的次数。任何非零值都意味着有用户被错误地拒绝。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(seckill_requests_total{result=\"system_error\"}) or vector(0)",
+          "legendFormat": "系统繁忙"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "② 库存一致性（核心）",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis 库存 vs DB 库存",
+      "description": "两条线应当重合。分叉即意味着数据漂移——Redis 扣了但 DB 没扣，或反之。这是整套可靠性机制最终要守住的不变量。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Redis"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "MySQL"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "seckill_stock_redis",
+          "legendFormat": "券{{voucher}} Redis"
+        },
+        {
+          "refId": "B",
+          "expr": "seckill_stock_db",
+          "legendFormat": "券{{voucher}} MySQL"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "库存差异（Redis − DB）",
+      "description": "非 0 即漂移。注意：对账任务只在消息队列排空时采样，所以这个值在压测进行中可能短暂滞后，属正常。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 12,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": -1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(seckill_stock_redis - seckill_stock_db) or vector(0)",
+          "legendFormat": "差异"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "已落库订单数",
+      "description": "由对账任务统计。与「累计成功订单」对比可以看出异步消费是否有积压。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 16,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(seckill_orders_count) or vector(0)",
+          "legendFormat": "订单数"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "对账告警（累计）",
+      "description": "对账任务发现的异常总数：超卖、库存漂移、订单丢失、Redis 记录缺失等。非 0 就要去看服务端日志里的 SEC_ALERT。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 20,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "seckill_reconcile_alerts or vector(0)",
+          "legendFormat": "告警"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "③ 消息链路健康",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "消息投递：成功 vs 失败",
+      "description": "失败率必须为 0。投递失败意味着 Redis 已扣减但消息没进 broker——代码里会回滚，但回滚本身也可能失败，所以这个指标要盯住。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(seckill_messages_sent_total[1m])",
+          "legendFormat": "投递成功"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(seckill_messages_send_failed_total[1m]) or vector(0)",
+          "legendFormat": "投递失败"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "消费：落库 / 幂等拦截 / 重试 / 死信",
+      "description": "幂等拦截（duplicates）非零说明消息在重复投递——这是唯一索引在起作用，属预期；但长期偏高要去查为什么重投。死信（dlq）非零必须告警。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 10,
+        "x": 8,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(seckill_orders_created_total[1m])",
+          "legendFormat": "订单落库"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(seckill_consume_duplicates_total[1m]) or vector(0)",
+          "legendFormat": "幂等拦截"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(seckill_consume_retries_total[1m]) or vector(0)",
+          "legendFormat": "重试"
+        },
+        {
+          "refId": "D",
+          "expr": "rate(seckill_consume_dlq_total[1m]) or vector(0)",
+          "legendFormat": "进死信"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "死信队列深度（必须为 0）",
+      "description": "重试阶梯被击穿的信号。大于 0 说明有消息重试 3 次仍失败，需要人工介入。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 18,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(seckill_dlq_depth) or vector(0)",
+          "legendFormat": "深度"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "④ 延迟",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "秒杀 Lua 预检 P99",
+      "description": "预检是请求线程上唯一的 Redis 往返（库存判断 + 去重 + 扣减 + 记录，单次原子操作）。这个延迟直接决定秒杀接口的响应时间。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum(rate(seckill_lua_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "P99"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum(rate(seckill_lua_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "P50"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "订单消费 P99",
+      "description": "消费者处理单条消息的耗时，含落库与扣库存的事务。这个值升高说明 DB 有压力。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum(rate(seckill_consume_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "P99"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum(rate(seckill_consume_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "P50"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP 接口 P99",
+      "description": "整个秒杀接口的响应时间。与上面的 Lua 预检对比，可以看出请求线程上还有多少额外开销。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum(rate(http_server_requests_seconds_bucket[1m])) by (le, uri))",
+          "legendFormat": "{{uri}}"
+        }
+      ]
+    }
+  ]
+}

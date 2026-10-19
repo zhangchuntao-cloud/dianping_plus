@@ -1,32 +1,89 @@
-  server:
-    port: 8081
-  spring:
-    rabbitmq:
-      host: localhost
-      port: 5672
-      username: guest
-      password: guest
-    application:
-      name: hmdp
-    datasource:
-      driver-class-name: com.mysql.jdbc.Driver
-      url: jdbc:mysql://127.0.0.1:3306/dingping?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
-      username: root
-      password: 290390
+server:
+  port: 8081
+spring:
+  application:
+    name: hmdp
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3307}/${MYSQL_DATABASE:dingping}?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD:root}
+  data:
     redis:
-      host: 127.0.0.1
-      port: 6379
-
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6380}
       lettuce:
         pool:
           max-active: 30
           max-idle: 15
           min-idle: 5
           time-between-eviction-runs: 10s
-    jackson:
-      default-property-inclusion: non_null # JSON处理时忽略非空字段
-  mybatis-plus:
-    type-aliases-package: com.hmdp.entity # 别名扫描包
-  logging:
-    level:
-      com.hmdp: debug
+  rabbitmq:
+    host: ${RABBITMQ_HOST:127.0.0.1}
+    port: ${RABBITMQ_PORT:5673}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    # 发送端可靠性：correlated 才能拿到 CorrelationData 的 future，
+    # 从而把"broker 是否真的收下了"变成可判断的事实
+    publisher-confirm-type: correlated
+    # 消息路由不到任何队列时退回给发送方（配合 template.mandatory）
+    publisher-returns: true
+    template:
+      mandatory: true
+      retry:
+        enabled: false   # 发送重试由我们自己的补偿 + 对账负责，不叠加一层
+    listener:
+      simple:
+        # 手动 ACK：事务提交后才确认，避免"消息已确认但活没干"
+        acknowledge-mode: manual
+        prefetch: 20
+        concurrency: 4
+        max-concurrency: 8
+        # 刻意不配 retry.enabled：重试走我们自己的延迟队列，
+        # 而不是 Spring 的 RetryTemplate（后者与手动 ACK 组合是个坑）
+  jackson:
+    default-property-inclusion: non_null # JSON处理时忽略非空字段
+mybatis-plus:
+  type-aliases-package: com.hmdp.entity # 别名扫描包
+hmdp:
+  seckill:
+    reconcile-interval-ms: 60000 # 对账任务调度间隔
+  upload:
+    # 图片存放根目录。默认是工作目录下的 uploads/imgs（跨平台可用）。
+    # 原实现硬编码了 D:\tlias\... 这个课程环境的 Windows 路径，
+    # 在 macOS / Linux 上每次上传都会 500。
+    image-dir: uploads/imgs
+  voucher:
+    # 允许调用造券接口（POST /voucher、POST /voucher/seckill）的用户 id，逗号分隔。
+    # 留空表示不限制（便于本地开发）；**部署时必须配置**，否则任何人都能造券——
+    # 造券会把库存写进 Redis，等于可以凭空创造秒杀库存。
+    admin-ids: ""
+
+# 可观测性
+#
+# 秒杀链路的可靠性工作（幂等拦截、消息重试、对账补偿）本身是"看不见"的——
+# 代码里做对了，但线上没有任何信号。这里把指标暴露给 Prometheus，
+# 让"有没有超卖""消息有没有丢""重试了多少次"变成能看见的曲线。
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    # 注意：这里刻意不配 metrics.tags.application。
+    # Spring Boot 的 Prometheus 注册表默认已经注入了 application 标签（取自
+    # spring.application.name），再从 commonTags 配一个同名标签会导致 Prometheus
+    # 把其中之一重命名为 exported_application —— 同一个指标出现两条序列，
+    # 大盘上的 stat 面板就会显示成两个值。
+    distribution:
+      percentiles-histogram:
+        # 为这些指标生成直方图，才能在 Grafana 里算 P99
+        seckill.lua.duration: true
+        seckill.consume.duration: true
+        http.server.requests: true
+logging:
+  level:
+    com.hmdp: debug

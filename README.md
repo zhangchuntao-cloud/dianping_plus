@@ -508,224 +508,222 @@ Redis Stream 适用于轻量、低可靠性、无大量堆积的简单异步场�
 
 **✅改进：** 使用RabbitMQ更适合。相关面试题可以看这个[相关文章](https://kneegcyao.github.io/posts/93c6a719.html);
 
-**1.在`application.yml`中配置RabbitMQ**
+---
 
-```yaml
-  spring:
-    rabbitmq:
-      host: localhost
-      port: 5672
-      username: guest
-      password: guest
-```
+### ⚠️ 原设计有个致命错误：把 TTL 设在业务队列上
 
-- **2. 声明队列和交换机**
-  - **正常队列和交换机的绑定：**
-     commonExchange ("Common") → 使用路由键 "CQ" 绑定到 queueC ("CQ")。
-  - **死信队列和交换机的绑定：**
-     deadLetterExchange ("Dead-letter") → 使用路由键 "DLQ" 绑定到 deadLetterQueueD ("DLQ")。
-  - **普通队列到死信交换机的关系（死信机制）：**
-     queueC ("CQ") 配置了：
-    - 死信交换机为 **Dead-letter**；
-    - 死信路由键为 **"DLQ"**；
-    - TTL 为 10 秒。
-  - 当 **queueC** 中的消息超过 TTL 或触发其它死信条件后，这些消息将被自动发送到 **deadLetterExchange**，再由 **deadLetterExchange** 根据 **"DLQ"** 路由键路由到 **deadLetterQueueD**。
+原实现是这样的：
 
 ```java
-@Configuration
-public class QueueConfig {
-
-    // 普通交换机名称
-    public static final String COMMON_EXCHANGE = "Common";
-    // 死信交换机名称
-    public static final String DEAD_DEAD_LETTER_EXCHANGE = "Dead-letter";
-    // 普通队列名称
-    public static final String QUEUE_C = "CQ";
-    // 死信队列名称
-    public static final String DEAD_LETTER_QUEUE_D = "DLQ";
-
-    /**
-     * 声明普通交换机
-     * 
-     * @return DirectExchange
-     */
-    @Bean("commonExchange")
-    public DirectExchange commonExchange(){
-        return new DirectExchange(COMMON_EXCHANGE);
-    }
-
-    /**
-     * 声明死信交换机
-     * 
-     * @return DirectExchange
-     */
-    @Bean("deadLetterExchange")
-    public DirectExchange deadLetterExchange(){
-        return new DirectExchange(DEAD_DEAD_LETTER_EXCHANGE);
-    }
-
-    /**
-     * 声明普通队列C, 并绑定死信交换机及设置消息TTL
-     * 
-     * 设置说明：
-     * - x-dead-letter-exchange: 配置消息过期后转发的死信交换机名称
-     * - x-dead-letter-routing-key: 配置转发到死信交换机时使用的路由键，此处与死信队列绑定时的路由键一致（"DLQ"）
-     * - x-message-ttl: 消息存活时间（此处设置为10000毫秒，即10秒）
-     *
-     * @return Queue
-     */
-    @Bean("queueC")
-    public Queue queueC(){
-        HashMap<String, Object> arguments = new HashMap<>();
-        // 消息在队列中存活10秒后失效，进入死信队列
-        arguments.put("x-message-ttl", 10000);
-        // 配置死信交换机
-        arguments.put("x-dead-letter-exchange", DEAD_DEAD_LETTER_EXCHANGE);
-        // 配置死信路由键，绑定到死信队列时使用
-        arguments.put("x-dead-letter-routing-key", "DLQ");
-
-        return QueueBuilder.durable(QUEUE_C)
-                           .withArguments(arguments)
-                           .build();
-    }
-
-    /**
-     * 声明死信队列D
-     * 
-     * @return Queue
-     */
-    @Bean("deadLetterQueueD")
-    public Queue deadLetterQueueD(){
-        return QueueBuilder.durable(DEAD_LETTER_QUEUE_D)
-                           .build();
-    }
-
-    /**
-     * 普通队列C与普通交换机Common绑定
-     *
-     * 当消息发送到交换机Common，并使用路由键 "CQ" 时，
-     * 消息将被路由到队列CQ。
-     *
-     * @param queueC 普通队列
-     * @param commonExchange 普通交换机
-     * @return Binding
-     */
-    @Bean
-    public Binding bindingQueueCToCommonExchange(@Qualifier("queueC") Queue queueC,
-                                                 @Qualifier("commonExchange") DirectExchange commonExchange) {
-        return BindingBuilder.bind(queueC).to(commonExchange).with("CQ");
-    }
-
-    /**
-     * 死信队列D与死信交换机Dead-letter绑定
-     *
-     * 当普通队列CQ中的消息由于TTL过期或其他原因被转为死信后，
-     * 消息会转发到死信交换机Dead-letter，并使用路由键 "DLQ"，
-     * 从而被路由到死信队列DLQ。
-     *
-     * @param deadLetterQueueD 死信队列
-     * @param deadLetterExchange 死信交换机
-     * @return Binding
-     */
-    @Bean
-    public Binding bindingDeadLetterQueueDToDeadLetterExchange(@Qualifier("deadLetterQueueD") Queue deadLetterQueueD,
-                                                               @Qualifier("deadLetterExchange") DirectExchange deadLetterExchange) {
-        return BindingBuilder.bind(deadLetterQueueD).to(deadLetterExchange).with("DLQ");
-    }
+@Bean("queueC")
+public Queue queueC(){
+    HashMap<String, Object> arguments = new HashMap<>();
+    arguments.put("x-message-ttl", 10000);                        // ← 问题在这
+    arguments.put("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE);
+    arguments.put("x-dead-letter-routing-key", "DLQ");
+    return QueueBuilder.durable(QUEUE_C).withArguments(arguments).build();
 }
-
 ```
 
-**3.发送者**
+当时的理解是：「消息 10 秒还没处理完，就当作失败丢进死信队列重试」。
 
-```java
-       VoucherOrder order = new VoucherOrder();
-        order.setId(orderId);
-        order.setUserId(userId);
-        order.setVoucherId(voucherId);
-        // 你可以用 JSON，也可以用序列化
-        // 增加消息发送的异常处理
-        //放入mq
-        String jsonStr = JSONUtil.toJsonStr(order);
-        try {
-            rabbitTemplate.convertAndSend("Common","CQ",jsonStr );
-        } catch (Exception e) {
-            log.error("发送 RabbitMQ 消息失败，订单ID: {}", orderId, e);
-            throw new RuntimeException("发送消息失败");
-        }
-        // 3. 返回订单号给前端（实际下单异步处理）
-        return Result.ok(orderId);
-    }
-```
+**这个理解是错的。** `x-message-ttl` 是**队列驻留计时器**，它的语义是「消息在队列的 ready 集合里存活超过 TTL 就变成死信」，**跟消费成功与否毫无关系**：
 
-**4.接受者**
+- 一条消息如果毫秒级就被消费并 ACK，它已经从队列移除了，**永远不会过期**；
+- 只有**在 ready 集合里干等了 10 秒**的消息才会被判定为死信 —— 而"干等"意味着消费者停摆或消费慢，不是"处理失败"。
 
-```java
-@Component
-@RequiredArgsConstructor
-@Slf4j
-public class SeckillVoucherListener {
+所以这个配置的真实效果是：**业务队列变成一个有损队列，积压超过 10 秒的消息会被静默改道到一个完全不同的处理器**。而那个死信处理器（`receivedD`）里做的是**一模一样**的 `save()` + 扣库存，且它自己连死信配置都没有 —— 消息进去就出不来。
 
-    @Resource
-    SeckillVoucherServiceImpl seckillVoucherService;
-    
-    @Resource
-    VoucherOrderServiceImpl voucherOrderService;
+真正导致数据损坏的还有两条：
 
-    /**
-     * 普通队列消费者：监听队列 "CQ"
-     *
-     * 消息从普通队列 "CQ" 进入后进行转换处理，保存订单，同时数据库秒杀库存减一
-     *
-     * @param message RabbitMQ消息
-     * @param channel 消息通道
-     * @throws Exception 异常处理
-     */
-    @RabbitListener(queues = "CQ")
-    public void receivedC(Message message, Channel channel) throws Exception {
-        String msg = new String(message.getBody());
-        log.info("普通队列:");
-        VoucherOrder voucherOrder = JSONUtil.toBean(msg, VoucherOrder.class);
-        log.info(voucherOrder.toString());
-        voucherOrderService.save(voucherOrder);  // 保存订单到数据库
+1. **没有唯一索引兜底**。一人一单的唯一守卫是 Redis 的 `SISMEMBER`。Redis 一旦重启丢 key、内存淘汰或 `FLUSHDB`，守卫就消失了，同一用户会拿到第二条订单 —— 这是必然发生、可稳定复现的。
+2. **AUTO ack + `defaultRequeueRejected=true`**。消费者抛异常时 Spring AMQP 默认 `basicNack(requeue=true)`，消息立刻重新投递 → 再抛 → **没有延迟、没有上限的热循环**，一个毒消息就能把 CPU 和日志打满。
 
-        // 秒杀业务：库存减一操作
-        Long voucherId = voucherOrder.getVoucherId();
-        seckillVoucherService.update()
-                .setSql("stock = stock - 1") // set stock = stock - 1
-                .eq("voucher_id", voucherId)
-                .gt("stock", 0)             // where voucher_id = ? and stock > 0
-                .update();
-    }
+---
 
-    /**
-     * 死信队列消费者：监听队列 "DLQ"
-     *
-     * 消息从死信队列 "DLQ" 进入后进行相同的处理，
-     * 适用于消息因过期或其它原因进入死信队列时的处理逻辑
-     *
-     * @param message RabbitMQ消息
-     * @throws Exception 异常处理
-     */
-    @RabbitListener(queues = "DLQ")
-    public void receivedDLQ(Message message) throws Exception {
-        log.info("死信队列:");
-        String msg = new String(message.getBody());
-        VoucherOrder voucherOrder = JSONUtil.toBean(msg, VoucherOrder.class);
-        log.info(voucherOrder.toString());
-        voucherOrderService.save(voucherOrder);  // 保存订单到数据库
-
-        // 秒杀业务：库存减一操作
-        Long voucherId = voucherOrder.getVoucherId();
-        seckillVoucherService.update()
-                .setSql("stock = stock - 1") // set stock = stock - 1
-                .eq("voucher_id", voucherId)
-                .gt("stock", 0)             // where voucher_id = ? and stock > 0
-                .update();
-    }
-}
+### 重新设计后的消息链路
 
 ```
+POST /voucher-order/seckill/{id}
+  │
+  ├─ 1. orderId = RedisIdWorker.nextId("order")
+  ├─ 2. EVALSHA seckill.lua  KEYS=[stock{id}, order{id}]  ARGV=[userId, orderId]
+  │         -1 未初始化 | 1 库存不足 | 2 重复下单 | 0 通过
+  ├─ 3. convertAndSend(seckill.exchange, seckill.order, json, CorrelationData)
+  │         同步等待 broker confirm（≤500ms）
+  │         失败 → EVALSHA seckill_rollback.lua 回滚 Redis → 返回"系统繁忙"
+  └─ 4. Result.ok(orderId)          ← 请求线程全程不碰 MySQL
+        │
+        ▼
+  seckill.exchange ──seckill.order──▶ seckill.order.queue
+        （无 TTL、无 DLX、手动 ACK）        │
+                                          ├─ 成功        → basicAck
+                                          ├─ DuplicateKey→ basicAck（幂等成功，不重试）
+                                          └─ 其他异常    → republish + basicAck
+                                                          │
+                        retry < 3 ────────────────────────┤
+                                                          ▼
+  seckill.retry.exchange ──▶ seckill.retry.queue     seckill.dlx.exchange
+      （TTL 5s，无人消费，到期 DLX 回业务交换机）              ──▶ seckill.dlq（停车场，无消费者）
+
+  @Scheduled(60s) SeckillReconcileJob
+    · 流水线静止时：补 Redis 有单而 DB 缺的订单、校验库存、按需回写 Redis 库存
+    · 任何时候：DB 有单而 Redis 无记录 → 告警
+    · 死信队列非空 → 告警
+```
+
+### 关键设计点（面试可讲）
+
+**1. 业务队列不设任何参数。** 失败走向由消费者**显式决定**，而不是"因为排队久了所以换个人处理"。TTL 只出现在专门的延迟重试队列上 —— 这才是 TTL 的正确用法。
+
+**2. 事务提交之后才 ACK。** 业务方法返回即事务已提交，此时 ACK 才安全。若在事务内 ACK，事务随后回滚就会出现"消息已确认但活没干"——静默丢单。所以 `@Transactional` 必须放在**独立的 service 方法**上，由监听器通过注入的代理调用，而不是直接标在 `@RabbitListener` 方法上。
+
+**3. 永远不用 `basicNack(requeue=true)`。** 重试一律走延迟队列，有延迟、有上限。
+
+**4. 先插订单，再扣库存。** 重复消息会先撞唯一索引 `uk_user_voucher`，此时库存分毫未动；库存耗尽抛异常时，事务回滚会把刚插入的订单一并撤销。两个操作在同一事务里，这是"要么全成、要么全不成"的唯一保证。异常必须在事务方法**之外**捕获，否则不会回滚。
+
+**5. 幂等分两层，各管一件事：**
+
+| 层 | 挡住什么 |
+|---|---|
+| Redis `HEXISTS`（Lua 内） | 用户狂点按钮。挡不住的话每次重复请求都会扣一次 Redis 库存，DB 唯一索引虽然只放行一条，但**Redis 库存已经被多扣了** |
+| DB `UNIQUE (user_id, voucher_id)` | 消息重复投递、Redis 丢 key、broker 重发。这是最终兜底，因为它和业务写入在同一个事务里 |
+
+**6. 发送端同步等 confirm。** `convertAndSend` 默认 fire-and-forget —— 只要 TCP 写成功就返回，broker 是否持久化、消息是否路由到队列，发送方一概不知。开启 `publisher-confirm-type: correlated` 后可以拿到 `CorrelationData` 的 future，把"消息确实落地了"变成可判断的事实。失败则回滚 Redis 扣减（回滚脚本会比对 orderId 才动手，避免抹掉一条其实已投递成功的有效订单）。
+
+**7. 对账是最后一道防线。** 前面几层都在保证"不出错"，对账负责"出错了也能自己发现并修好"。原则是**只做幂等且非破坏性的操作**：Redis 有单 DB 没单 → 自动补单；DB 有单 Redis 没记录 → 只告警不删数据；库存对不上 → 只告警。
+
+> 对账任务有个必须注意的坑：`orderCount` 和 `dbStock` 是两条独立 SQL，各自是一个瞬间的快照。消费进行中时两次读取来自不同时刻，二者必然"看起来"对不上。所以库存校验**必须只在流水线静止时做**（业务队列和重试队列的 ready + unacked 都为 0）。这个误报是压测时实测到的，已修。
+
+**8. 缓存预热 / 灾难恢复。** 秒杀的全部前置状态都在 Redis 里。Redis 一旦重启或被 flush，Lua 会一直返回 `-1`，用户看到"秒杀尚未开始"且**永远不会自愈**。应用启动时按 DB 重建缺失的 key，只补缺失的、绝不覆盖已存在的。
+
+### 压测结果
+
+`scripts/seckill-loadtest.py`（纯标准库，无需 JMeter），300 并发抢 100 库存：
+
+| 指标 | 结果 |
+|---|---|
+| QPS | 1653 |
+| P50 / P95 / P99 | 25.1 / 71.8 / 79.5 ms |
+| HTTP 错误 | 0 |
+| 成功 / 业务拒绝 | 100 / 200（库存不足） |
+| **超卖数** | **0** |
+| **重复单数** | **0** |
+| Redis 与 DB 库存一致性 | ✅ |
+| 对账告警 | 0 |
+
+**混沌测试**——模拟 Redis 丢 key（`DEL seckill:order:{10}` 并把库存回滚到 100），让同样的 300 个用户重放一遍：
+
+| | 结果 |
+|---|---|
+| Redis 侧 | 100 个请求通过预检（去重记录已被删除） |
+| DB 侧 | **仍然 100 条订单、0 重复、库存 0** |
+| 唯一索引拦截 | 97 次 `DuplicateKeyException`，全部按幂等成功 ACK |
+
+旧代码在这个场景下会产生 100 条重复订单 —— 这正是加唯一索引的价值。
+
+---
+
+# 可观测性：让"做对了"变成"看得见"
+
+前面的可靠性机制（幂等拦截、消息重试、对账补偿）在代码里做对了，但线上**完全看不见**——
+"有没有超卖""消息有没有丢""重试了多少次"都只能翻日志。指标是把它们变成可观测曲线的唯一途径。
+
+## 启动监控栈
+
+```bash
+docker compose up -d     # 会一并启动 Prometheus 与 Grafana
+```
+
+| 服务 | 地址 |
+|---|---|
+| Grafana 大盘 | http://localhost:3000/d/hmdp-seckill （免登录） |
+| Prometheus | http://localhost:9090 |
+| 应用指标端点 | http://localhost:8081/actuator/prometheus |
+
+数据源与大盘都通过 **Grafana provisioning 自动加载**，不需要手工点界面配置。
+clone 下来 `docker compose up` 就能看到大盘。
+
+## 大盘的四个分区
+
+![秒杀链路可靠性大盘](docs/images/grafana-dashboard.png)
+
+### ① 请求总览
+
+按**终态**区分请求速率，而不是只看总量：
+
+| 终态 | 含义 | 期望 |
+|---|---|---|
+| `success` | 预检通过、消息已投递 | 抢到的量 |
+| `out_of_stock` | 库存不足 | 抢购场景下占大头，正常 |
+| `duplicate` | 同一用户重复下单 | 少数；突增说明有人在刷 |
+| `not_initialized` | Redis 库存 key 不存在 | **应为 0**，非 0 说明缓存被清空且未预热 |
+| `system_error` | Lua 异常 / 消息投递失败已回滚 | **必须为 0**，每个都意味着一个用户被错误拒绝 |
+
+用标签而非多个计数器，PromQL 里一次查询就能算出各占比。
+
+### ② 库存一致性（核心）
+
+**Redis 库存与 DB 库存两条曲线应当重合。** 分叉即意味着数据漂移——
+Redis 扣了但 DB 没扣，或反之。这是整套可靠性机制最终要守住的不变量。
+旁边配一个 `Redis − DB` 的差值面板，非 0 直接标红。
+
+> **一个设计细节**：库存快照只在**流水线静止**时采样（业务队列与重试队列的
+> ready + unacked 都为 0）。因为非静止时订单数与库存是两条独立 SQL 读出来的
+> 不同瞬间的值，刷进指标会在大盘上产生**假的漂移尖刺**。
+> 这个坑在压测时踩过——对账任务误报 `DB_STOCK_DRIFT`。
+
+### ③ 消息链路健康
+
+| 指标 | 意义 |
+|---|---|
+| 投递成功 / 失败 | 失败意味着 Redis 已扣减但消息没进 broker；代码会回滚，但回滚本身也可能失败，所以要盯住 |
+| 订单落库 | 消费者侧的吞吐 |
+| **幂等拦截** | 被唯一索引挡下的重复消息。非零说明消息在重复投递——**这是唯一索引在起作用**，属预期；但长期偏高要去查为什么重投 |
+| 重试 / 进死信 | 重试是延迟队列在工作；**死信非零说明重试阶梯被击穿，必须告警** |
+| 死信队列深度 | 停车场里积压了多少需要人工介入的消息 |
+
+### ④ 延迟
+
+Lua 预检、订单消费、HTTP 接口三组 P50/P99。
+
+- **Lua 预检**是请求线程上唯一的 Redis 往返（库存判断 + 去重 + 扣减 + 记录，
+  单次原子操作），它直接决定秒杀接口的响应时间
+- **订单消费**包含落库与扣库存事务，这个值升高说明 DB 有压力
+- 两者对比可以看出请求线程上还有多少额外开销
+
+## 指标是怎么埋的
+
+集中定义在 `SeckillMetrics`（`com.hmdp.metrics`）。
+
+**为什么集中而非散落各处**：指标名拼错**不会报错**，只会静默地不显示。
+集中定义保证"埋点"和"大盘查询"用的是同一份事实源——
+这和 `SeckillKeys` 集中管理 Redis key 是同一个理由。
+
+几个实现细节：
+
+- **五个请求终态的计数器在启动时预注册**。否则计数器要等第一次出现该终态才注册，
+  导致大盘在启动初期显示"无数据"，而且 `rate()` 在第一个数据点之前算不出来。
+- **瞬时值用 Gauge + AtomicLong**，由对账任务周期性刷新。
+  Gauge 持有 `AtomicLong` 的引用，所以更新 `AtomicLong` 就等于更新指标，无需重新注册。
+- **为延迟指标开启 `percentiles-histogram`**（见 `application.yaml`），
+  否则 Grafana 里算不出 P99。
+
+## 压测验证
+
+300 并发抢 100 库存后，Prometheus 里的指标与压测脚本的断言完全吻合：
+
+| 指标 | 值 | 压测脚本的独立断言 |
+|---|---|---|
+| `success` | 100 | 成功 100 |
+| `out_of_stock` | 200 | 业务拒绝 200 |
+| `orders_created` | 100 | 已售订单 100 |
+| `duplicates` / `dlq` | 0 / 0 | 重复单 0 |
+| `stock_redis` / `stock_db` | 0 / 0 | 库存在 DB 与 Redis 都归零 |
+
+两条独立的观测路径（Prometheus 指标 / 脚本直接查 Redis+MySQL）得出同一结论，
+说明指标是真实数据而非摆设。
+
 ---
 
 

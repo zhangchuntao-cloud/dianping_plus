@@ -1,0 +1,15 @@
+# Grafana 大盘自动加载
+#
+# 把 dashboards 目录下的 JSON 自动导入，免去手工 Import。
+apiVersion: 1
+
+providers:
+  - name: 'hmdp'
+    orgId: 1
+    folder: '秒杀'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
