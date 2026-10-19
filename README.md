@@ -1,24 +1,93 @@
 ## 项目描述
 
-点评项目是一个springboot开发的前后端分离项目，使用了redis集群、tomcat集群、MySQL集群提高服务性能。类似于大众点评，实现了短信登录、商户查询缓存、优惠卷秒杀、附近的商户、UV统计、用户签到、好友关注、达人探店  八个部分。其中重点使用了分布式锁实现了一人一单功能、项目中大量使用了Redis 的知识。
+仿大众点评的本地生活服务平台（Java / Spring Boot），实现了短信登录、商户查询缓存、优惠券秒杀、附近商户、UV 统计、用户签到、好友关注、达人探店等功能。
+
+**项目的核心不在功能数量，而在秒杀链路的可靠性工程。** 高并发下最容易出问题的不是"能不能下单"，而是"会不会超卖、会不会重复下单、消息丢了怎么办、数据漂移了怎么发现"。本项目围绕这些问题做了一整套工程化处理，并用压测与混沌测试验证。
+
+## 秒杀链路做了什么
+
+### 一、正确性
+
+| 问题 | 处理 |
+|---|---|
+| 超卖 | Redis + Lua 原子预检（库存判断、用户去重、扣减、记录一次完成），DB 侧再用 `stock > 0` 乐观条件兜底 |
+| 重复下单 | 两层防护：Redis `HEXISTS` 挡住用户狂点（否则 Redis 库存会被多扣）；DB 唯一索引 `uk_user_voucher` 兜住消息重投与 Redis 丢 key |
+| 消费原子性 | `save()` 与扣库存在**同一事务**内，且**先插订单再扣库存**——重复消息先撞唯一索引，此时库存分毫未动 |
+| 消息不丢 | 发送端 `publisher-confirm-type: correlated` 同步等 broker 确认；失败则用 Lua 回滚 Redis 扣减（脚本会比对 orderId，避免抹掉有效订单） |
+| 消费不重 | 手动 ACK，事务提交后才确认；`DuplicateKeyException` 按幂等成功处理，绝不重试 |
+
+### 二、可靠性
+
+- **三段式 MQ 拓扑**：业务队列（无 TTL、无 DLX）→ 延迟重试队列（TTL 5s，到期 DLX 回业务交换机）→ 死信停车场（无消费者，人工介入）
+- **永远不用 `basicNack(requeue=true)`**：它会形成没有延迟、没有上限的热循环，一个毒消息就能把 CPU 和日志打满
+- **对账任务**：Redis 有单 DB 无单 → 自动补单；DB 有单 Redis 无记录 → 只告警；库存漂移 → 只在流水线静止时校验并回写
+- **缓存预热**：Redis 被清空后 Lua 会一直返回 `-1` 且无法自愈，启动时按 DB 重建缺失的 key
+
+### 三、可观测性
+
+Micrometer + Prometheus + Grafana，把"做对了"变成"看得见"：
+
+- 请求终态分布（成功 / 库存不足 / 重复 / 系统繁忙 / 未初始化）
+- **Redis 库存与 DB 库存两条曲线，应当重合**——分叉即意味着数据漂移
+- 消息投递、幂等拦截、重试、死信深度
+- Lua 预检与订单消费的 P50/P99
+
+![秒杀链路可靠性大盘](docs/images/grafana-dashboard.png)
+
+### 四、实测数据
+
+`scripts/seckill-loadtest.py`（纯标准库，无需 JMeter），300 并发抢 100 库存：
+
+| 指标 | 结果 |
+|---|---|
+| QPS / P99 | 1653 / 79.5 ms |
+| HTTP 错误 | 0 |
+| **超卖数 / 重复单数** | **0 / 0** |
+| Redis 与 DB 库存一致性 | ✅ |
+
+**混沌测试**——模拟 Redis 丢 key（删除去重记录并把库存回滚到 100），让同样的 300 个用户重放：
+
+| | 结果 |
+|---|---|
+| Redis 侧 | 100 个请求通过预检 |
+| DB 侧 | **仍然 100 条订单、0 重复、库存 0** |
+| 唯一索引拦截 | 97 次 `DuplicateKeyException`，全部幂等 ACK |
+
+旧代码在这个场景下会产生 100 条重复订单 —— 这正是加唯一索引的价值。
 
 ## 所用技术
 
-*SpringBoot+nginx+MySql+Lombok+MyBatis-Plus+Hutool+Redis+RabbitMQ*
+Spring Boot 3.2 · JDK 17 · MySQL 8 · Redis · RabbitMQ · MyBatis-Plus · Redisson · Prometheus · Grafana · Docker Compose
 
-使用 Redis 解决了在集群模式下的 Session共享问题,使用拦截器实现用户的登录校验和权限刷新
+## 快速开始
 
-基于Cache Aside模式解决数据库与缓存的一致性问题
+```bash
+# 1. 一键起中间件（MySQL / Redis / RabbitMQ / Prometheus / Grafana）
+docker compose up -d
 
-使用 Redis 对高频访问的信息进行缓存，降低了数据库查询的压力,解决了缓存穿透、雪崩、击穿问题
+# 2. 启动应用（需 JDK 17）
+mvn spring-boot:run
 
-使用 Redis + Lua脚本实现对用户秒杀资格的预检，同时用乐观锁解决秒杀产生的超卖问题
+# 3. 访问
+#    应用      http://localhost:8081
+#    监控大盘   http://localhost:3000/d/hmdp-seckill
+#    Prometheus http://localhost:9090
+```
 
-使用Redis分布式锁解决了在集群模式下一人一单的线程安全问题
+构建时若默认 JDK 不是 17，需显式指定：
 
-(基于stream结构作为消息队列,实现异步秒杀下单),优化为使用RabbitMQ作为消息队列,实现异步解耦
+```bash
+JAVA_HOME=/path/to/jdk17 mvn spring-boot:run
+```
 
-使用Redis的 ZSet 数据结构实现了点赞排行榜功能,使用Set 集合实现关注、共同关注功能 
+## 压测
+
+```bash
+# 先造秒杀券（或直接用库里已有的）
+python3 scripts/seckill-loadtest.py --users 300 --token-file src/test/resources/tokens.txt
+```
+
+---
 
 # 项目 亮点难点
 
